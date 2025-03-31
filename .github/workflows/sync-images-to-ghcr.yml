@@ -25,14 +25,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: List files in workspace
+        run: |
+          ls -la & echo 'Current directory: $(pwd)''
+
       - name: Setup yq
-        uses: mikefarah/yq@v4.44.2 # Action to install yq (YAML processor utility)
+        uses: mikefarah/yq@v4.44.2
         with:
-          cmd: eval '.images' docker-images-sync.yml -o=json -I=0
+          cmd: yq eval '.images' docker-images-sync.yml -o=json -I=0
 
       - name: Generate matrix from YAML
         id: set_matrix
-        # Reads the 'images' array from the YAML file (docker-images-sync.yml in the root) and converts it to compact JSON
+        # Reads the 'images' array from the YAML file and converts it to compact JSON
         run: echo "matrix=$(yq eval '.images' docker-images-sync.yml -o=json -I=0)" >> $GITHUB_OUTPUT
 
   # --- Job 2: Synchronize images in parallel with retry logic (using Bash) ---
