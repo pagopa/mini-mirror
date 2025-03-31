@@ -1,0 +1,166 @@
+# .github/workflows/sync-images-to-ghcr.yaml
+name: Sync Images to GHCR
+
+# Triggers: Run manually or on push/merge to the main branch
+on:
+  workflow_dispatch: # Allows manual triggering from the GitHub Actions UI
+  push:
+    branches:
+      - main # Or your primary branch name
+    paths:
+      - 'docker-images-sync.yml' # Run only if the YAML file changes
+      - '.github/workflows/sync-images-to-ghcr.yaml' # Or if the workflow file itself changes
+
+permissions:
+  contents: read # Needed to checkout the code and read the YAML file
+  packages: write # Needed to write (push) to GitHub Container Registry (GHCR)
+
+jobs:
+  # --- Job 1: Read the YAML file and prepare the matrix for the next job ---
+  prepare_matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set_matrix.outputs.matrix }} # Export the matrix as an output
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup yq
+        uses: mikefarah/yq@v4.44.2 # Action to install yq (YAML processor utility)
+
+      - name: Generate matrix from YAML
+        id: set_matrix
+        # Reads the 'images' array from the YAML file (docker-images-sync.yml in the root) and converts it to compact JSON
+        run: echo "matrix=$(yq -o=json -c '.images' docker-images-sync.yml)" >> $GITHUB_OUTPUT
+
+  # --- Job 2: Synchronize images in parallel with retry logic (using Bash) ---
+  sync_image:
+    needs: prepare_matrix # Depends on the job that prepares the matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # If one image fails, others continue
+      matrix: ${{ fromJson(needs.prepare_matrix.outputs.matrix) }} # Creates a job for each item in the JSON array
+    steps:
+      - name: Print Image Details
+        run: |
+          echo "--------------------------------------------------"
+          echo "⏳ Processing Image:"
+          echo "  Docker Hub Repo:    ${{ matrix.dockerhub_repository }}"
+          echo "  Docker Hub Tag:     ${{ matrix.dockerhub_tag }}"
+          echo "  Docker Hub Digest:  ${{ matrix.dockerhub_digest }}"
+          echo "  GHCR Package Name:  ${{ matrix.ghcr_package_name }}"
+          echo "  GHCR Tag:           ${{ matrix.ghcr_tag }}"
+          echo "--------------------------------------------------"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }} # The user or app that triggered the workflow
+          password: ${{ secrets.GITHUB_TOKEN }} # Use the automatically generated GITHUB_TOKEN for authentication
+
+      - name: Check, Pull, Tag, and Push Image with Retries (Bash)
+        env:
+          # Environment variables for the script, taken from the matrix
+          DH_REPO: ${{ matrix.dockerhub_repository }}
+          DH_TAG: ${{ matrix.dockerhub_tag }} # Used for logging, pull uses digest
+          DH_DIGEST: ${{ matrix.dockerhub_digest }}
+          GHCR_PKG: ${{ matrix.ghcr_package_name }}
+          GHCR_TAG: ${{ matrix.ghcr_tag }}
+          # Build the full image name on GHCR
+          # Note: github.repository_owner is converted to lowercase as required by GHCR
+          GHCR_IMAGE_FULL_NAME: ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
+          DH_IMAGE_FULL_NAME_DIGEST: ${{ matrix.dockerhub_repository }}@${{ matrix.dockerhub_digest }}
+        run: |
+          # Bash function to execute a command with retries
+          # Arguments:
+          # $1: Maximum number of attempts (e.g., 4 = 1 initial attempt + 3 retries)
+          # $2: Array of wait times in seconds between attempts (e.g., "30 60 300")
+          # $3+: The command to execute
+          retry_command() {
+            local max_attempts=$1
+            local wait_times=($2) # Convert the string to a bash array
+            local cmd=("${@:3}") # Get all arguments from the third one onwards as the command
+            local attempt=1
+            local exit_code=0
+
+            while [ $attempt -le $max_attempts ]; do
+              # Indentation preserved for readability within retry loop
+              echo "   ⏳ Attempt $attempt/$max_attempts: Executing command -> ${cmd[*]}"
+              # Execute the command
+              "${cmd[@]}"
+              exit_code=$?
+
+              # If the command succeeds (exit code 0), exit the function
+              if [ $exit_code -eq 0 ]; then
+                echo "   ✅ Command executed successfully."
+                return 0
+              fi
+
+              # If it's the last attempt, exit with failure
+              if [ $attempt -eq $max_attempts ]; then
+                echo "   ❌ ERROR: Command failed after $max_attempts attempts."
+                return $exit_code # Return the last exit code
+              fi
+
+              # Calculate the index for the wait time (0-based)
+              local wait_index=$((attempt - 1))
+              # Make sure to use the last wait time if the index is out of bounds (unlikely with 3 waits for 4 attempts)
+              local wait_time
+              if [ $wait_index -lt ${#wait_times[@]} ]; then
+                wait_time=${wait_times[$wait_index]}
+              else
+                wait_time=${wait_times[-1]}
+              fi
+
+              echo "   ⚠️ Command failed with code $exit_code. Waiting ${wait_time}s before next attempt..."
+              sleep "$wait_time"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          echo "ℹ️ Checking if image exists in GHCR: $GHCR_IMAGE_FULL_NAME"
+
+          # Check if the image manifest already exists on GHCR
+          # `docker manifest inspect` returns a non-zero exit code if the image doesn't exist
+          # Redirect stdout and stderr to /dev/null to avoid cluttering the log on success
+          if ! docker manifest inspect "$GHCR_IMAGE_FULL_NAME" > /dev/null 2>&1; then
+            # --- Image NOT found in GHCR ---
+            echo "ℹ️ Not Found! Image is missing from GHCR. Proceeding with pull and push."
+
+            # --- PULL with Retry ---
+            echo " PULL: Attempting to download image from Docker Hub: $DH_IMAGE_FULL_NAME_DIGEST"
+            # 1 initial attempt + 3 retries = 4 total attempts. Waits: 30s, 60s, 300s
+            retry_command 4 "30 60 300" docker pull "$DH_IMAGE_FULL_NAME_DIGEST"
+            if [ $? -ne 0 ]; then
+              echo "❌ FATAL ERROR: Pull failed for $DH_IMAGE_FULL_NAME_DIGEST after all attempts."
+              exit 1 # Fail the job for this image
+            fi
+            echo "✅ PULL: Download complete."
+
+            # --- TAG ---
+            echo "🏷️ TAG: Tagging image for GHCR as $GHCR_IMAGE_FULL_NAME"
+            # Apply the GHCR tag to the downloaded image
+            docker tag "$DH_IMAGE_FULL_NAME_DIGEST" "$GHCR_IMAGE_FULL_NAME"
+            if [ $? -ne 0 ]; then
+              echo "❌ ERROR: Tagging failed for $GHCR_IMAGE_FULL_NAME"
+              exit 1 # Exit with error (tagging usually doesn't require retry)
+            fi
+            echo "✅ TAG: Tagging complete."
+
+            # --- PUSH with Retry ---
+            echo " PUSH: Attempting to upload image to GHCR: $GHCR_IMAGE_FULL_NAME"
+            # 1 initial attempt + 3 retries = 4 total attempts. Waits: 30s, 60s, 300s
+            retry_command 4 "30 60 300" docker push "$GHCR_IMAGE_FULL_NAME"
+            if [ $? -ne 0 ]; then
+              echo "❌ FATAL ERROR: Push failed for $GHCR_IMAGE_FULL_NAME after all attempts."
+              exit 1 # Fail the job for this image
+            fi
+            echo "✅ PUSH: Upload complete."
+            echo "🎉 Success: Image $DH_REPO:$DH_TAG synchronized to GHCR as $GHCR_IMAGE_FULL_NAME" # Changed emoji for final success
+
+          else
+            # --- Image ALREADY found in GHCR ---
+            echo "✅ Already Exists! Image $GHCR_IMAGE_FULL_NAME is already present in GHCR. Skipping."
+          fi
+          echo "--------------------------------------------------"

@@ -1,0 +1,6 @@
+images:
+  - dockerhub_repository: "grafana/k6"
+    dockerhub_tag: "0.58.0"
+    dockerhub_digest: "sha256:6a4eabc37ea8274aff48804ff1add146b4eda476fdf50ea6e9cdf083a3967616"
+    ghcr_package_name: "grafana-k6"
+    ghcr_tag: "0.58.0"
