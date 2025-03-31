@@ -1,0 +1,18 @@
+- # Alpine Latest
+  dockerhub_repository: "alpine"
+  dockerhub_tag: "latest"
+  dockerhub_digest: "sha256:9c6f0724472873bb50a2ae67a9e7062b0940a57b181ann7f68e539f3c3658384" 
+  ghcr_package_name: "alpine"
+  ghcr_tag: "latest"
+- # Alpine Versione Specifica
+  dockerhub_repository: "alpine"
+  dockerhub_tag: "3.19.1"
+  dockerhub_digest: "sha256:0a189a9c4d3674b4b8998066b6b3b3f1b8e9f9f9e8e8d8d8c8c8b8b8a8a80000"
+  ghcr_package_name: "alpine"
+  ghcr_tag: "3.19.1"
+- # Alpine Edge
+  dockerhub_repository: "alpine"
+  dockerhub_tag: "edge"
+  dockerhub_digest: "sha256:f8ab003a9c6f0724472873bb50a2ae67a9e7062b0940a57b181ann7f68e539f3"
+  ghcr_package_name: "alpine"
+  ghcr_tag: "edge"
