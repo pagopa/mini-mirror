@@ -265,7 +265,7 @@ jobs:
           echo "  Docker Hub Digest:  ${{ matrix.dockerhub_digest }}" # Used for pull
           echo "  GHCR Package Name:  ${{ matrix.ghcr_package_name }}"
           echo "  GHCR Tag:           ${{ matrix.ghcr_tag }}"
-          echo "  Target GHCR Image:  ghcr.io/${{ github.repository_owner,, }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}"
+          echo "  Target GHCR Image:  ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}"
           echo "--------------------------------------------------"
 
       - name: Login to GitHub Container Registry
