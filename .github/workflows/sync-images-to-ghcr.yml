@@ -1,5 +1,5 @@
 # .github/workflows/sync-images-to-ghcr.yaml
-name: 🎫 Sync Images to GHCR (Multi-File)
+name: 🎫 Sync Images to GHCR
 
 # Triggers: Run manually or on push/merge to the main branch
 on:
@@ -8,7 +8,7 @@ on:
     branches:
       - main # Or your primary branch name
     paths:
-      # CORRECTED: Watch the directory containing the definitions
+      # Watch the directory containing the definitions
       - 'docker-image-sync-definitions/**'
       - '.github/workflows/sync-images-to-ghcr.yaml' # Or if the workflow file itself changes
 
@@ -17,227 +17,347 @@ permissions:
   packages: write # Needed to write (push) to GitHub Container Registry (GHCR)
 
 jobs:
-  # --- Job 1: Read YAML files from directory and prepare the matrix ---
+  # --- Job 1: Read YAML files from directory and prepare the initial matrix ---
   prepare_matrix:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set_matrix.outputs.matrix }} # Export the matrix as an output
+      matrix: ${{ steps.set_matrix.outputs.matrix }} # Export the raw matrix as an output
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 1: Install yq using wget
+      # Step 1: Install yq
       - name: Install yq
         run: |
           echo "ℹ️ Installing yq..."
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
-            echo "✅ yq installed."
-            echo "📦 yq version: $(yq --version)"
+          echo "✅ yq installed."
+          echo "📦 yq version: $(yq --version)"
 
-      # Step 2: Install jq (needed for JSON processing)
+      # Step 2: Install jq (needed for JSON processing/display)
       - name: Install jq
         run: |
           echo "ℹ️ Installing jq..."
           sudo apt-get update && sudo apt-get install -y jq
-            echo "✅ jq installed."
-            echo "📦 jq version: $(jq --version)"
+          echo "✅ jq installed."
+          echo "📦 jq version: $(jq --version)"
 
-      # Step 4: Find YAML files, aggregate data, and generate matrix (with Debug)
+      # Step 3: Find YAML files, aggregate data, and generate matrix
       - name: Generate matrix from YAML files
         id: set_matrix
         run: |
           echo "ℹ️ Finding YAML files in docker-image-sync-definitions/ ..."
-          # Step 4a: Generate the flat JSON array of image objects
-          FLAT_JSON_ARRAY=$(find docker-image-sync-definitions -name '*.yml' -type f -exec yq -o=json --indent 0 '.' {} + | jq -s 'flatten' | yq --indent 0)
+          # Generate the flat JSON array of image objects
+          FLAT_JSON_ARRAY=$(find docker-image-sync-definitions -name '*.yml' -type f -exec yq -o=json --indent 0 '.' {} + | jq -s 'flatten | map(select(.dockerhub_repository != null and .dockerhub_digest != null and .ghcr_package_name != null and .ghcr_tag != null))' | yq --indent 0) # Added validation
 
-          # --- Debug Start: Print Flat Array ---
-          echo "--------------------------------------------------"
-          echo "DEBUG: Flat JSON Array generated:"
-          echo "$FLAT_JSON_ARRAY"
-          echo "--------------------------------------------------"
-          # --- Debug End ---
+          # Construct the final {"include": [...]} structure
+          FINAL_JSON_OUTPUT=$(printf '{"include":%s}' "$FLAT_JSON_ARRAY")
 
-          # Step 4b: Construct the final {"include": [...]} structure
-          # Using printf for potentially safer string construction if array is huge, though echo should work fine too
-          printf -v FINAL_JSON_OUTPUT '{"include":%s}' "$FLAT_JSON_ARRAY"
-          # Alternative with echo:
-          # FINAL_JSON_OUTPUT="{\"include\":$FLAT_JSON_ARRAY}"
-
-          # --- Debug Start: Print Final Structure ---
-          echo "--------------------------------------------------"
-          echo "DEBUG: Final JSON structure for matrix output:"
-          echo "$FINAL_JSON_OUTPUT"
-          echo "--------------------------------------------------"
-          # --- Debug End ---
-
-          # Step 4c: Check the generated array and set the output
-          # Note: Checking FLAT_JSON_ARRAY as FINAL_JSON_OUTPUT will always have {"include":...}
+          # Check the generated array and set the output
           if [ -z "$FLAT_JSON_ARRAY" ] || [ "$FLAT_JSON_ARRAY" = "null" ] || [ "$FLAT_JSON_ARRAY" = "[]" ]; then
             echo "⚠️ WARNING: No valid image definitions found or failed to generate JSON array."
-            echo "Setting matrix to empty include to prevent downstream errors."
+            echo "Setting matrix to empty include."
+            # Output the empty structure so the 'if' condition in the next job works reliably
             echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
           else
-            echo "✅ Matrix JSON generated."
+            echo "✅ Raw Matrix JSON generated."
             echo "matrix=$FINAL_JSON_OUTPUT" >> $GITHUB_OUTPUT
           fi
 
-      # Step 5: Display the generated matrix JSON (formatted for readability)
-      - name: Display Generated Matrix JSON
+      # Step 4: Display the generated raw matrix JSON (formatted)
+      - name: Display Raw Generated Matrix JSON
         run: |
           echo "--------------------------------------------------"
-          echo "Final Matrix Output (formatted by jq):"
-          # Use single quotes to pass the literal string to jq
+          echo "Raw Matrix Output (before filtering):"
           echo '${{ steps.set_matrix.outputs.matrix }}' | jq '.'
           echo "--------------------------------------------------"
 
-  # --- Job 2: Synchronize images in parallel with retry logic (using Bash) ---
-  sync_image:
-    needs: prepare_matrix # Depends on the job that prepares the matrix
-    # Only run if the matrix is not empty (optional guard)
-    # if: needs.prepare_matrix.outputs.matrix != '{"include":[]}'
+  # --- Job 2: Filter out images that already exist in GHCR (using Python) ---
+  filter_existing_images:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false # If one image fails, others continue
-      # Use fromJson with the {"include": [...]} structure generated above
-      matrix: ${{ fromJson(needs.prepare_matrix.outputs.matrix) }}
+    needs: prepare_matrix # Depends on the job that prepares the raw matrix
+    outputs:
+      # Default filtered_matrix to empty string if not set by script
+      filtered_matrix: ${{ steps.filter_step.outputs.filtered_matrix || '' }}
+    # Only run if the raw matrix is not empty
+    if: needs.prepare_matrix.outputs.matrix != '{"include":[]}'
     steps:
-      - name: Print Image Details
-        run: |
-          # Check if matrix context is actually populated (needed if 'if:' condition above is removed)
-          if [ -z "${{ matrix.dockerhub_repository }}" ]; then
-            echo "⚠️ Skipping step as matrix seems empty."
-            exit 0
-          fi
-          echo "--------------------------------------------------"
-          echo "⏳ Processing Image:"
-          echo "  Docker Hub Repo:    ${{ matrix.dockerhub_repository }}"
-          echo "  Docker Hub Tag:     ${{ matrix.dockerhub_tag }}"
-          echo "  Docker Hub Digest:  ${{ matrix.dockerhub_digest }}"
-          echo "  GHCR Package Name:  ${{ matrix.ghcr_package_name }}"
-          echo "  GHCR Tag:           ${{ matrix.ghcr_tag }}"
-          echo "--------------------------------------------------"
+      # Step 1: Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x' # Use a recent Python 3 version
 
+      # Step 2: Install jq (needed for displaying matrix)
+      - name: Install jq
+        run: |
+          echo "ℹ️ Installing jq..."
+          sudo apt-get update && sudo apt-get install -y jq
+          echo "✅ jq installed."
+          echo "📦 jq version: $(jq --version)"
+
+      # Step 3: Login to GitHub Container Registry
       - name: Login to GitHub Container Registry
-        # if: matrix.dockerhub_repository != '' # Optional condition
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }} # The user or app that triggered the workflow
-          password: ${{ secrets.GITHUB_TOKEN }} # Use the automatically generated GITHUB_TOKEN for authentication
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check, Pull, Tag, and Push Image with Retries (Bash)
-        # if: matrix.dockerhub_repository != '' # Optional condition
+      # Step 4: Check GHCR and filter the matrix using Python
+      - name: Check GHCR and Filter Matrix (Python)
+        id: filter_step
+        env:
+          RAW_MATRIX_JSON: ${{ needs.prepare_matrix.outputs.matrix }}
+          GH_OWNER_LOWERCASE: ${{ github.repository_owner }} # Pass owner name (Python will handle case if needed)
+          # GITHUB_OUTPUT is automatically available to the script in newer runners
+        run: |
+          python - <<EOF
+          import json
+          import os
+          import subprocess
+          import sys
+
+          # Get environment variables
+          raw_matrix_json = os.environ.get('RAW_MATRIX_JSON')
+          # Get the owner name passed from the workflow env
+          # Convert to lower case within Python for consistency
+          gh_owner = os.environ.get('GH_OWNER_LOWERCASE', '').lower()
+          # Get the path to the GitHub Actions output file
+          github_output_env = os.environ.get('GITHUB_OUTPUT')
+
+          if not raw_matrix_json or not gh_owner:
+              print(f"Error: Missing required environment variables. RAW_MATRIX_JSON empty: {not raw_matrix_json}, GH_OWNER_LOWERCASE empty: {not gh_owner}", file=sys.stderr)
+              sys.exit(1)
+          if not github_output_env:
+              print("Error: GITHUB_OUTPUT environment variable not found.", file=sys.stderr)
+              sys.exit(1)
+
+
+          print(f"ℹ️ Filtering matrix based on images present in GHCR (ghcr.io/{gh_owner}/...)")
+          print("--------------------------------------------------")
+
+          images_to_keep = []
+          images_to_skip_log = []
+
+          try:
+              # Parse the input JSON
+              matrix_data = json.loads(raw_matrix_json)
+              images_to_check = matrix_data.get('include', [])
+
+              if not isinstance(images_to_check, list):
+                  print("Error: Invalid matrix format - 'include' key is not a list.", file=sys.stderr)
+                  sys.exit(1)
+
+              # Iterate through each image definition
+              for image_data in images_to_check:
+                  # Basic validation for required keys in each image object
+                  required_keys = ['dockerhub_repository', 'dockerhub_tag', 'ghcr_package_name', 'ghcr_tag']
+                  if not all(key in image_data for key in required_keys):
+                      print(f"⚠️ Skipping invalid entry: {image_data} - Missing required keys.", file=sys.stderr)
+                      continue
+
+                  dh_repo = image_data['dockerhub_repository']
+                  dh_tag = image_data['dockerhub_tag'] # For logging
+                  ghcr_pkg = image_data['ghcr_package_name']
+                  ghcr_tag = image_data['ghcr_tag']
+
+                  # Construct the full GHCR image name using the lowercase owner
+                  ghcr_image_full_name = f"ghcr.io/{gh_owner}/{ghcr_pkg}:{ghcr_tag}"
+
+                  print(f"🔎 Checking: {ghcr_image_full_name}")
+
+                  # Check if the image manifest exists on GHCR using subprocess
+                  process = subprocess.run(
+                      ['docker', 'manifest', 'inspect', ghcr_image_full_name],
+                      capture_output=True, text=True, check=False
+                  )
+
+                  # Check the return code of the docker command
+                  if process.returncode == 0:
+                      # Image FOUND in GHCR - Skip
+                      skip_message = f"✅ Exists! Skipping: {ghcr_image_full_name} (Source: {dh_repo}:{dh_tag})"
+                      print(skip_message)
+                      images_to_skip_log.append(f" - {ghcr_image_full_name}")
+                  else:
+                      # Image NOT found in GHCR - Keep
+                      keep_message = f"ℹ️ Missing! Will sync: {ghcr_image_full_name} (Source: {dh_repo}:{dh_tag})"
+                      print(keep_message)
+                      images_to_keep.append(image_data) # Keep the original image data dictionary
+
+          except json.JSONDecodeError:
+              print(f"Error: Failed to parse RAW_MATRIX_JSON.", file=sys.stderr)
+              sys.exit(1)
+          except Exception as e:
+              print(f"An unexpected error occurred during processing: {e}", file=sys.stderr)
+              sys.exit(1) # Exit if errors occurred during filtering
+
+
+          print("--------------------------------------------------")
+          if images_to_skip_log:
+              print("📋 Skipped Images (already in GHCR):")
+              print("\n".join(images_to_skip_log))
+          else:
+              print("✅ No images were skipped (none found in GHCR).")
+          print("--------------------------------------------------")
+
+
+          # Only proceed to set output if there are images to keep
+          if images_to_keep:
+              # Construct the final filtered matrix object
+              filtered_matrix_obj = {"include": images_to_keep}
+
+              # Print the raw list of images to keep, formatted as JSON for better readability in logs
+              print("📋 Images to be Synchronized (raw list):")
+              print(json.dumps(images_to_keep, indent=2))
+              print("--------------------------------------------------")
+
+              # Convert the filtered matrix object to a JSON string
+              filtered_matrix_json_output = json.dumps(filtered_matrix_obj)
+
+              # Set the output for the next job using environment file redirection
+              try:
+                  with open(github_output_env, 'a') as f:
+                      # Ensure the JSON string is properly escaped for multiline output if needed
+                      escaped_json = filtered_matrix_json_output.replace('%', '%25').replace('\n', '%0A').replace('\r', '%0D')
+                      f.write(f"filtered_matrix={escaped_json}\n")
+                  print("✅ Filtered matrix generated and saved to output using Python file I/O.")
+
+              except Exception as e:
+                  print(f"An unexpected error occurred during output writing: {e}", file=sys.stderr)
+                  sys.exit(1) # Exit if output writing fails
+          else:
+             # If images_to_keep is empty, print message and do NOT set the output
+             print("⚠️ No images to synchronize. Output 'filtered_matrix' will not be set.")
+
+          # The closing delimiter MUST be at the start of the line with no trailing characters
+          EOF
+
+      # Step 5: Display the filtered matrix JSON (using jq for formatting)
+      # This step will now only show output if the previous step actually set it
+      - name: Display Filtered Matrix JSON (if set)
+        # Only run if the output was actually set in the previous step
+        if: steps.filter_step.outputs.filtered_matrix
+        run: |
+          echo "--------------------------------------------------"
+          echo "Final Filtered Matrix Output (for sync job):"
+          echo '${{ steps.filter_step.outputs.filtered_matrix }}' | jq '.'
+          echo "--------------------------------------------------"
+
+
+  # --- Job 3: Synchronize images in parallel (using the filtered matrix) ---
+  sync_image:
+    # Needs the job that filters the matrix
+    needs: filter_existing_images
+    # Only run if the filtered matrix output was set (implicitly checks for non-empty string)
+    if: needs.filter_existing_images.outputs.filtered_matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # If one image fails, others continue
+      # Use fromJson with the *filtered* {"include": [...]} structure from the Python script output
+      # This will only run if the 'if' condition above is true, meaning the output exists and is not empty
+      matrix: ${{ fromJson(needs.filter_existing_images.outputs.filtered_matrix) }}
+    steps:
+      # MODIFIED: Construct target image name directly in run script
+      - name: Print Image Details for Sync
+        run: |
+          # Construct the target name using github context directly
+          TARGET_IMAGE="ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}"
+          echo "--------------------------------------------------"
+          echo "Syncing Image:"
+          echo "  Docker Hub Repo:    ${{ matrix.dockerhub_repository }}"
+          echo "  Docker Hub Tag:     ${{ matrix.dockerhub_tag }}" # Primarily for reference
+          echo "  Docker Hub Digest:  ${{ matrix.dockerhub_digest }}" # Used for pull
+          echo "  GHCR Package Name:  ${{ matrix.ghcr_package_name }}"
+          echo "  GHCR Tag:           ${{ matrix.ghcr_tag }}"
+          echo "  Target GHCR Image:  $TARGET_IMAGE"
+          echo "--------------------------------------------------"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # MODIFIED: Construct GHCR_IMAGE_FULL_NAME directly using github context
+      - name: Pull, Tag, and Push Image with Retries (Bash)
         env:
           # Environment variables for the script, taken from the matrix
           DH_REPO: ${{ matrix.dockerhub_repository }}
-          DH_TAG: ${{ matrix.dockerhub_tag }} # Used for logging, pull uses digest
+          DH_TAG: ${{ matrix.dockerhub_tag }} # Used for logging
           DH_DIGEST: ${{ matrix.dockerhub_digest }}
           GHCR_PKG: ${{ matrix.ghcr_package_name }}
           GHCR_TAG: ${{ matrix.ghcr_tag }}
-          # Build the full image name on GHCR
-          # CORRECTED: Convert github.repository_owner to lowercase using ',,'
+          # Construct the full image names directly using github context
           GHCR_IMAGE_FULL_NAME: ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
           DH_IMAGE_FULL_NAME_DIGEST: ${{ matrix.dockerhub_repository }}@${{ matrix.dockerhub_digest }}
         run: |
-          # Bash function to execute a command with retries
-          # Arguments:
-          # $1: Maximum number of attempts (e.g., 4 = 1 initial attempt + 3 retries)
-          # $2: Array of wait times in seconds between attempts (e.g., "30 60 300")
-          # $3+: The command to execute
+          # Bash function to execute a command with retries (same as before)
           retry_command() {
             local max_attempts=$1
-            local wait_times=($2) # Convert the string to a bash array
-            local cmd=("${@:3}") # Get all arguments from the third one onwards as the command
+            local wait_times=($2)
+            local cmd=("${@:3}")
             local attempt=1
             local exit_code=0
 
             while [ $attempt -le $max_attempts ]; do
-              # Indentation preserved for readability within retry loop
               echo "   ⏳ Attempt $attempt/$max_attempts: Executing command -> ${cmd[*]}"
-              # Execute the command
               "${cmd[@]}"
               exit_code=$?
-
-              # If the command succeeds (exit code 0), exit the function
               if [ $exit_code -eq 0 ]; then
                 echo "   ✅ Command executed successfully."
                 return 0
               fi
-
-              # If it's the last attempt, exit with failure
               if [ $attempt -eq $max_attempts ]; then
                 echo "   ❌ ERROR: Command failed after $max_attempts attempts."
-                return $exit_code # Return the last exit code
+                return $exit_code
               fi
-
-              # Calculate the index for the wait time (0-based)
               local wait_index=$((attempt - 1))
-              # Make sure to use the last wait time if the index is out of bounds
               local wait_time
               if [ $wait_index -lt ${#wait_times[@]} ]; then
                 wait_time=${wait_times[$wait_index]}
               else
-                # Use the last element if index is out of bounds
                 wait_time=${wait_times[-1]}
               fi
-
-
               echo "   ⚠️ Command failed with code $exit_code. Waiting ${wait_time}s before next attempt..."
               sleep "$wait_time"
               attempt=$((attempt + 1))
             done
           }
 
-          # Check if required variables are set (needed if 'if:' condition on step is removed)
-          if [ -z "$DH_REPO" ] || [ -z "$DH_DIGEST" ] || [ -z "$GHCR_PKG" ] || [ -z "$GHCR_TAG" ]; then
-             echo "⚠️ Skipping sync logic due to missing matrix parameters."
-             exit 0
+          # --- PULL with Retry ---
+          # Use the GHCR_IMAGE_FULL_NAME and DH_IMAGE_FULL_NAME_DIGEST vars defined in env
+          echo " PULL: Attempting to download image from Docker Hub: $DH_IMAGE_FULL_NAME_DIGEST"
+          retry_command 4 "30 60 300" docker pull "$DH_IMAGE_FULL_NAME_DIGEST"
+          if [ $? -ne 0 ]; then
+            echo "❌ FATAL ERROR: Pull failed for $DH_IMAGE_FULL_NAME_DIGEST after all attempts."
+            exit 1 # Fail the job for this image
           fi
+          echo "✅ PULL: Download complete."
 
-
-          echo "ℹ️ Checking if image exists in GHCR: $GHCR_IMAGE_FULL_NAME"
-
-          # Check if the image manifest already exists on GHCR
-          # `docker manifest inspect` returns a non-zero exit code if the image doesn't exist
-          # Redirect stdout and stderr to /dev/null to avoid cluttering the log on success
-          if ! docker manifest inspect "$GHCR_IMAGE_FULL_NAME" > /dev/null 2>&1; then
-            # --- Image NOT found in GHCR ---
-            echo "ℹ️ Not Found! Image is missing from GHCR. Proceeding with pull and push." # User's emoji choice
-
-            # --- PULL with Retry ---
-            echo " PULL: Attempting to download image from Docker Hub: $DH_IMAGE_FULL_NAME_DIGEST"
-            # 1 initial attempt + 3 retries = 4 total attempts. Waits: 30s, 60s, 300s
-            retry_command 4 "30 60 300" docker pull "$DH_IMAGE_FULL_NAME_DIGEST"
-            if [ $? -ne 0 ]; then
-              echo "❌ FATAL ERROR: Pull failed for $DH_IMAGE_FULL_NAME_DIGEST after all attempts."
-              exit 1 # Fail the job for this image
-            fi
-            echo "✅ PULL: Download complete."
-
-            # --- TAG ---
-            echo "🏷️ TAG: Tagging image for GHCR as $GHCR_IMAGE_FULL_NAME"
-            # Apply the GHCR tag to the downloaded image
-            docker tag "$DH_IMAGE_FULL_NAME_DIGEST" "$GHCR_IMAGE_FULL_NAME"
-            if [ $? -ne 0 ]; then
-              echo "❌ ERROR: Tagging failed for $GHCR_IMAGE_FULL_NAME"
-              exit 1 # Exit with error (tagging usually doesn't require retry)
-            fi
-            echo "✅ TAG: Tagging complete."
-
-            # --- PUSH with Retry ---
-            echo " PUSH: Attempting to upload image to GHCR: $GHCR_IMAGE_FULL_NAME"
-            # 1 initial attempt + 3 retries = 4 total attempts. Waits: 30s, 60s, 300s
-            retry_command 4 "30 60 300" docker push "$GHCR_IMAGE_FULL_NAME"
-            if [ $? -ne 0 ]; then
-              echo "❌ FATAL ERROR: Push failed for $GHCR_IMAGE_FULL_NAME after all attempts."
-              exit 1 # Fail the job for this image
-            fi
-            echo "✅ PUSH: Upload complete."
-            echo "🎉 Success: Image $DH_REPO:$DH_TAG synchronized to GHCR as $GHCR_IMAGE_FULL_NAME" # Changed emoji for final success
-
-          else
-            # --- Image ALREADY found in GHCR ---
-            echo "✅ Already Exists! Image $GHCR_IMAGE_FULL_NAME is already present in GHCR. Skipping."
+          # --- TAG ---
+          echo "🏷️ TAG: Tagging image for GHCR as $GHCR_IMAGE_FULL_NAME"
+          # Make sure GHCR_IMAGE_FULL_NAME is correctly formatted before tagging
+          if [[ ! "$GHCR_IMAGE_FULL_NAME" =~ ^ghcr\.io/[^/]+/[^:]+:.+$ ]]; then
+             echo "❌ ERROR: Invalid GHCR image format for tagging: $GHCR_IMAGE_FULL_NAME"
+             exit 1
           fi
+          docker tag "$DH_IMAGE_FULL_NAME_DIGEST" "$GHCR_IMAGE_FULL_NAME"
+          if [ $? -ne 0 ]; then
+            echo "❌ ERROR: Tagging failed for $GHCR_IMAGE_FULL_NAME"
+            exit 1
+          fi
+          echo "✅ TAG: Tagging complete."
+
+          # --- PUSH with Retry ---
+          echo " PUSH: Attempting to upload image to GHCR: $GHCR_IMAGE_FULL_NAME"
+          retry_command 4 "30 60 300" docker push "$GHCR_IMAGE_FULL_NAME"
+          if [ $? -ne 0 ]; then
+            echo "❌ FATAL ERROR: Push failed for $GHCR_IMAGE_FULL_NAME after all attempts."
+            exit 1 # Fail the job for this image
+          fi
+          echo "✅ PUSH: Upload complete."
+          echo "🎉 Success: Image $DH_REPO:$DH_TAG synchronized to GHCR as $GHCR_IMAGE_FULL_NAME"
           echo "--------------------------------------------------"
