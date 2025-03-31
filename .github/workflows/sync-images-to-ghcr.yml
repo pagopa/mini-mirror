@@ -1,5 +1,5 @@
 # .github/workflows/sync-images-to-ghcr.yaml
-name: 🎫 Sync Images to GHCR
+name: 🎫 Sync Images to GHCR (Multi-File)
 
 # Triggers: Run manually or on push/merge to the main branch
 on:
@@ -8,15 +8,16 @@ on:
     branches:
       - main # Or your primary branch name
     paths:
-      - 'docker-images-sync.yml' # Run only if the YAML file changes
+      # CORRECTED: Watch the directory containing the definitions
+      - 'docker-image-sync-definitions/**'
       - '.github/workflows/sync-images-to-ghcr.yaml' # Or if the workflow file itself changes
 
 permissions:
-  contents: read # Needed to checkout the code and read the YAML file
+  contents: read # Needed to checkout the code and read the YAML file(s)
   packages: write # Needed to write (push) to GitHub Container Registry (GHCR)
 
 jobs:
-  # --- Job 1: Read the YAML file and prepare the matrix for the next job ---
+  # --- Job 1: Read YAML files from directory and prepare the matrix ---
   prepare_matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -25,36 +26,89 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Note: This step executes yq via the action's 'cmd' input
-      - name: Setup yq
-        uses: mikefarah/yq@v4.45.1
-        with:
-          cmd: yq -o=json --indent=0 '.images' docker-images-sync.yml
+      # Step 1: Install yq using wget
+      - name: Install yq
+        run: |
+          echo "ℹ️ Installing yq..."
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+            echo "✅ yq installed."
+            echo "📦 yq version: $(yq --version)"
 
-      - name: Generate matrix from YAML
+      # Step 2: Install jq (needed for JSON processing)
+      - name: Install jq
+        run: |
+          echo "ℹ️ Installing jq..."
+          sudo apt-get update && sudo apt-get install -y jq
+            echo "✅ jq installed."
+            echo "📦 jq version: $(jq --version)"
+
+      # Step 4: Find YAML files, aggregate data, and generate matrix (with Debug)
+      - name: Generate matrix from YAML files
         id: set_matrix
         run: |
-          # Format the matrix with proper include structure and ensure proper JSON format
-          echo "matrix={\"include\":$(yq -o=json --indent=0 '.images' docker-images-sync.yml)}" >> $GITHUB_OUTPUT
+          echo "ℹ️ Finding YAML files in docker-image-sync-definitions/ ..."
+          # Step 4a: Generate the flat JSON array of image objects
+          FLAT_JSON_ARRAY=$(find docker-image-sync-definitions -name '*.yml' -type f -exec yq -o=json --indent 0 '.' {} + | jq -s 'flatten' | yq --indent 0)
 
-      # Debug step to verify the matrix format
+          # --- Debug Start: Print Flat Array ---
+          echo "--------------------------------------------------"
+          echo "DEBUG: Flat JSON Array generated:"
+          echo "$FLAT_JSON_ARRAY"
+          echo "--------------------------------------------------"
+          # --- Debug End ---
+
+          # Step 4b: Construct the final {"include": [...]} structure
+          # Using printf for potentially safer string construction if array is huge, though echo should work fine too
+          printf -v FINAL_JSON_OUTPUT '{"include":%s}' "$FLAT_JSON_ARRAY"
+          # Alternative with echo:
+          # FINAL_JSON_OUTPUT="{\"include\":$FLAT_JSON_ARRAY}"
+
+          # --- Debug Start: Print Final Structure ---
+          echo "--------------------------------------------------"
+          echo "DEBUG: Final JSON structure for matrix output:"
+          echo "$FINAL_JSON_OUTPUT"
+          echo "--------------------------------------------------"
+          # --- Debug End ---
+
+          # Step 4c: Check the generated array and set the output
+          # Note: Checking FLAT_JSON_ARRAY as FINAL_JSON_OUTPUT will always have {"include":...}
+          if [ -z "$FLAT_JSON_ARRAY" ] || [ "$FLAT_JSON_ARRAY" = "null" ] || [ "$FLAT_JSON_ARRAY" = "[]" ]; then
+            echo "⚠️ WARNING: No valid image definitions found or failed to generate JSON array."
+            echo "Setting matrix to empty include to prevent downstream errors."
+            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Matrix JSON generated."
+            echo "matrix=$FINAL_JSON_OUTPUT" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 5: Display the generated matrix JSON (formatted for readability)
       - name: Display Generated Matrix JSON
         run: |
           echo "--------------------------------------------------"
-          echo "Generated Matrix JSON Output:"
+          echo "Final Matrix Output (formatted by jq):"
+          # Use single quotes to pass the literal string to jq
           echo '${{ steps.set_matrix.outputs.matrix }}' | jq '.'
           echo "--------------------------------------------------"
 
   # --- Job 2: Synchronize images in parallel with retry logic (using Bash) ---
   sync_image:
     needs: prepare_matrix # Depends on the job that prepares the matrix
+    # Only run if the matrix is not empty (optional guard)
+    # if: needs.prepare_matrix.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false # If one image fails, others continue
-      matrix: ${{ fromJson(needs.prepare_matrix.outputs.matrix) }} # Creates a job for each item in the JSON array
+      # Use fromJson with the {"include": [...]} structure generated above
+      matrix: ${{ fromJson(needs.prepare_matrix.outputs.matrix) }}
     steps:
       - name: Print Image Details
         run: |
+          # Check if matrix context is actually populated (needed if 'if:' condition above is removed)
+          if [ -z "${{ matrix.dockerhub_repository }}" ]; then
+            echo "⚠️ Skipping step as matrix seems empty."
+            exit 0
+          fi
           echo "--------------------------------------------------"
           echo "⏳ Processing Image:"
           echo "  Docker Hub Repo:    ${{ matrix.dockerhub_repository }}"
@@ -65,6 +119,7 @@ jobs:
           echo "--------------------------------------------------"
 
       - name: Login to GitHub Container Registry
+        # if: matrix.dockerhub_repository != '' # Optional condition
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -72,6 +127,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }} # Use the automatically generated GITHUB_TOKEN for authentication
 
       - name: Check, Pull, Tag, and Push Image with Retries (Bash)
+        # if: matrix.dockerhub_repository != '' # Optional condition
         env:
           # Environment variables for the script, taken from the matrix
           DH_REPO: ${{ matrix.dockerhub_repository }}
@@ -80,7 +136,7 @@ jobs:
           GHCR_PKG: ${{ matrix.ghcr_package_name }}
           GHCR_TAG: ${{ matrix.ghcr_tag }}
           # Build the full image name on GHCR
-          # Note: github.repository_owner is NOT converted to lowercase here. This might cause issues with GHCR.
+          # CORRECTED: Convert github.repository_owner to lowercase using ',,'
           GHCR_IMAGE_FULL_NAME: ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
           DH_IMAGE_FULL_NAME_DIGEST: ${{ matrix.dockerhub_repository }}@${{ matrix.dockerhub_digest }}
         run: |
@@ -132,6 +188,13 @@ jobs:
               attempt=$((attempt + 1))
             done
           }
+
+          # Check if required variables are set (needed if 'if:' condition on step is removed)
+          if [ -z "$DH_REPO" ] || [ -z "$DH_DIGEST" ] || [ -z "$GHCR_PKG" ] || [ -z "$GHCR_TAG" ]; then
+             echo "⚠️ Skipping sync logic due to missing matrix parameters."
+             exit 0
+          fi
+
 
           echo "ℹ️ Checking if image exists in GHCR: $GHCR_IMAGE_FULL_NAME"
 
