@@ -27,11 +27,13 @@ jobs:
 
       - name: Setup yq
         uses: mikefarah/yq@v4.44.2 # Action to install yq (YAML processor utility)
+        with:
+          cmd: eval '.images' docker-images-sync.yml -o=json -I=0
 
       - name: Generate matrix from YAML
         id: set_matrix
         # Reads the 'images' array from the YAML file (docker-images-sync.yml in the root) and converts it to compact JSON
-        run: echo "matrix=$(yq -o=json -c '.images' docker-images-sync.yml)" >> $GITHUB_OUTPUT
+        run: echo "matrix=$(yq eval '.images' docker-images-sync.yml -o=json -I=0)" >> $GITHUB_OUTPUT
 
   # --- Job 2: Synchronize images in parallel with retry logic (using Bash) ---
   sync_image:
