@@ -108,9 +108,8 @@ jobs:
         id: filter_step
         env:
           RAW_MATRIX_JSON: ${{ needs.prepare_matrix.outputs.matrix }}
-          GH_OWNER_LOWERCASE: ${{ github.repository_owner }} # Convert owner to lowercase
+          GH_OWNER_LOWERCASE: ${{ github.repository_owner }} # Pass owner name (Python will handle case if needed)
           # GITHUB_OUTPUT is automatically available to the script in newer runners
-          # If using older runners, might need: GITHUB_OUTPUT: ${{ runner.temp }}/github_output_${{ github.run_id }}_${{ github.job }}
         run: |
           python - <<EOF
           import json
@@ -120,12 +119,14 @@ jobs:
 
           # Get environment variables
           raw_matrix_json = os.environ.get('RAW_MATRIX_JSON')
-          gh_owner = os.environ.get('GH_OWNER_LOWERCASE')
+          # Get the owner name passed from the workflow env
+          # Convert to lower case within Python for consistency
+          gh_owner = os.environ.get('GH_OWNER_LOWERCASE', '').lower()
           # Get the path to the GitHub Actions output file
           github_output_env = os.environ.get('GITHUB_OUTPUT')
 
           if not raw_matrix_json or not gh_owner:
-              print("Error: Missing required environment variables (RAW_MATRIX_JSON or GH_OWNER_LOWERCASE).", file=sys.stderr)
+              print(f"Error: Missing required environment variables. RAW_MATRIX_JSON empty: {not raw_matrix_json}, GH_OWNER_LOWERCASE empty: {not gh_owner}", file=sys.stderr)
               sys.exit(1)
           if not github_output_env:
               print("Error: GITHUB_OUTPUT environment variable not found.", file=sys.stderr)
@@ -160,7 +161,7 @@ jobs:
                   ghcr_pkg = image_data['ghcr_package_name']
                   ghcr_tag = image_data['ghcr_tag']
 
-                  # Construct the full GHCR image name
+                  # Construct the full GHCR image name using the lowercase owner
                   ghcr_image_full_name = f"ghcr.io/{gh_owner}/{ghcr_pkg}:{ghcr_tag}"
 
                   print(f"🔎 Checking: {ghcr_image_full_name}")
@@ -205,23 +206,18 @@ jobs:
           if not images_to_keep:
              print("⚠️ All images already exist in GHCR or no valid images found. Filtered matrix is empty.")
           else:
-             # --- MODIFIED SECTION START ---
              # Print the raw list of images to keep, formatted as JSON for better readability in logs
              print("📋 Images to be Synchronized (raw list):")
              print(json.dumps(images_to_keep, indent=2))
-             # --- MODIFIED SECTION END ---
           print("--------------------------------------------------")
 
           # Convert the filtered matrix object to a JSON string
           filtered_matrix_json_output = json.dumps(filtered_matrix_obj)
 
-          # --- REVERTED SECTION START ---
           # Set the output for the next job using environment file redirection
-          # This is the recommended way instead of ::set-output
           try:
               with open(github_output_env, 'a') as f:
                   # Ensure the JSON string is properly escaped for multiline output if needed
-                  # This is the standard GitHub Actions recommendation
                   escaped_json = filtered_matrix_json_output.replace('%', '%25').replace('\n', '%0A').replace('\r', '%0D')
                   f.write(f"filtered_matrix={escaped_json}\n")
               print("✅ Filtered matrix generated and saved to output using Python file I/O.")
@@ -229,9 +225,8 @@ jobs:
           except Exception as e:
               print(f"An unexpected error occurred during output writing: {e}", file=sys.stderr)
               sys.exit(1)
-          # --- REVERTED SECTION END ---
-
-          EOF # End of Python script heredoc
+          # The closing delimiter MUST be at the start of the line with no trailing characters
+          EOF
 
       # Step 5: Display the filtered matrix JSON (using jq for formatting)
       - name: Display Filtered Matrix JSON
@@ -257,6 +252,9 @@ jobs:
       matrix: ${{ fromJson(needs.filter_existing_images.outputs.filtered_matrix) }}
     steps:
       - name: Print Image Details for Sync
+        env:
+          # Define lowercase owner here using toLower for use in the echo command
+          GH_OWNER_LOWERCASE: ${{ format('{0}', github.repository_owner) }}
         run: |
           echo "--------------------------------------------------"
           echo "Syncing Image:"
@@ -265,8 +263,10 @@ jobs:
           echo "  Docker Hub Digest:  ${{ matrix.dockerhub_digest }}" # Used for pull
           echo "  GHCR Package Name:  ${{ matrix.ghcr_package_name }}"
           echo "  GHCR Tag:           ${{ matrix.ghcr_tag }}"
-          echo "  Target GHCR Image:  ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}"
+          # Use the lowercase owner variable defined in env
+          echo "  Target GHCR Image:  ghcr.io/$GH_OWNER_LOWERCASE/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}"
           echo "--------------------------------------------------"
+
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -283,8 +283,10 @@ jobs:
           DH_DIGEST: ${{ matrix.dockerhub_digest }}
           GHCR_PKG: ${{ matrix.ghcr_package_name }}
           GHCR_TAG: ${{ matrix.ghcr_tag }}
-          # Build the full image names
-          GHCR_IMAGE_FULL_NAME: ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
+          # Use GitHub Actions toLower() function for the owner
+          GH_OWNER_LOWERCASE: ${{ toLower(github.repository_owner) }}
+          # Build the full image names using the lowercase owner variable
+          GHCR_IMAGE_FULL_NAME: ghcr.io/${{ env.GH_OWNER_LOWERCASE }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
           DH_IMAGE_FULL_NAME_DIGEST: ${{ matrix.dockerhub_repository }}@${{ matrix.dockerhub_digest }}
         run: |
           # Bash function to execute a command with retries (same as before)
@@ -321,6 +323,7 @@ jobs:
           }
 
           # --- PULL with Retry ---
+          # Use the GHCR_IMAGE_FULL_NAME and DH_IMAGE_FULL_NAME_DIGEST vars defined in env
           echo " PULL: Attempting to download image from Docker Hub: $DH_IMAGE_FULL_NAME_DIGEST"
           retry_command 4 "30 60 300" docker pull "$DH_IMAGE_FULL_NAME_DIGEST"
           if [ $? -ne 0 ]; then
