@@ -203,7 +203,6 @@ jobs:
           print("--------------------------------------------------")
 
 
-          # --- MODIFIED SECTION START ---
           # Only proceed to set output if there are images to keep
           if images_to_keep:
               # Construct the final filtered matrix object
@@ -231,7 +230,6 @@ jobs:
           else:
              # If images_to_keep is empty, print message and do NOT set the output
              print("⚠️ No images to synchronize. Output 'filtered_matrix' will not be set.")
-          # --- MODIFIED SECTION END ---
 
           # The closing delimiter MUST be at the start of the line with no trailing characters
           EOF
@@ -252,7 +250,7 @@ jobs:
   sync_image:
     # Needs the job that filters the matrix
     needs: filter_existing_images
-    # MODIFIED: Only run if the filtered matrix output was set (implicitly checks for non-empty string)
+    # Only run if the filtered matrix output was set (implicitly checks for non-empty string)
     if: needs.filter_existing_images.outputs.filtered_matrix
     runs-on: ubuntu-latest
     strategy:
@@ -261,10 +259,11 @@ jobs:
       # This will only run if the 'if' condition above is true, meaning the output exists and is not empty
       matrix: ${{ fromJson(needs.filter_existing_images.outputs.filtered_matrix) }}
     steps:
+      # MODIFIED: Construct target image name directly in run script
       - name: Print Image Details for Sync
-        env:
-          GH_OWNER_LOWERCASE: ${{ github.repository_owner }}
         run: |
+          # Construct the target name using github context directly
+          TARGET_IMAGE="ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}"
           echo "--------------------------------------------------"
           echo "Syncing Image:"
           echo "  Docker Hub Repo:    ${{ matrix.dockerhub_repository }}"
@@ -272,10 +271,8 @@ jobs:
           echo "  Docker Hub Digest:  ${{ matrix.dockerhub_digest }}" # Used for pull
           echo "  GHCR Package Name:  ${{ matrix.ghcr_package_name }}"
           echo "  GHCR Tag:           ${{ matrix.ghcr_tag }}"
-          # Use the lowercase owner variable defined in env
-          echo "  Target GHCR Image:  ghcr.io/$GH_OWNER_LOWERCASE/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}"
+          echo "  Target GHCR Image:  $TARGET_IMAGE"
           echo "--------------------------------------------------"
-
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -284,6 +281,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # MODIFIED: Construct GHCR_IMAGE_FULL_NAME directly using github context
       - name: Pull, Tag, and Push Image with Retries (Bash)
         env:
           # Environment variables for the script, taken from the matrix
@@ -292,10 +290,8 @@ jobs:
           DH_DIGEST: ${{ matrix.dockerhub_digest }}
           GHCR_PKG: ${{ matrix.ghcr_package_name }}
           GHCR_TAG: ${{ matrix.ghcr_tag }}
-          # Use GitHub Actions toLower() function for the owner
-          GH_OWNER_LOWERCASE: ${{ github.repository_owner }}
-          # Build the full image names using the lowercase owner variable
-          GHCR_IMAGE_FULL_NAME: ghcr.io/${{ env.GH_OWNER_LOWERCASE }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
+          # Construct the full image names directly using github context
+          GHCR_IMAGE_FULL_NAME: ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
           DH_IMAGE_FULL_NAME_DIGEST: ${{ matrix.dockerhub_repository }}@${{ matrix.dockerhub_digest }}
         run: |
           # Bash function to execute a command with retries (same as before)
@@ -343,6 +339,11 @@ jobs:
 
           # --- TAG ---
           echo "🏷️ TAG: Tagging image for GHCR as $GHCR_IMAGE_FULL_NAME"
+          # Make sure GHCR_IMAGE_FULL_NAME is correctly formatted before tagging
+          if [[ ! "$GHCR_IMAGE_FULL_NAME" =~ ^ghcr\.io/[^/]+/[^:]+:.+$ ]]; then
+             echo "❌ ERROR: Invalid GHCR image format for tagging: $GHCR_IMAGE_FULL_NAME"
+             exit 1
+          fi
           docker tag "$DH_IMAGE_FULL_NAME_DIGEST" "$GHCR_IMAGE_FULL_NAME"
           if [ $? -ne 0 ]; then
             echo "❌ ERROR: Tagging failed for $GHCR_IMAGE_FULL_NAME"
