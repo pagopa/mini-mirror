@@ -284,7 +284,7 @@ jobs:
           GHCR_PKG: ${{ matrix.ghcr_package_name }}
           GHCR_TAG: ${{ matrix.ghcr_tag }}
           # Use GitHub Actions toLower() function for the owner
-          GH_OWNER_LOWERCASE: ${{ toLower(github.repository_owner) }}
+          GH_OWNER_LOWERCASE: ${{ format('{0}', github.repository_owner) }}
           # Build the full image names using the lowercase owner variable
           GHCR_IMAGE_FULL_NAME: ghcr.io/${{ env.GH_OWNER_LOWERCASE }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
           DH_IMAGE_FULL_NAME_DIGEST: ${{ matrix.dockerhub_repository }}@${{ matrix.dockerhub_digest }}
