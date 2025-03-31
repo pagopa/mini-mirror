@@ -106,7 +106,12 @@ jobs:
               # Calculate the index for the wait time (0-based)
               local wait_index=$((attempt - 1))
               # Make sure to use the last wait time if the index is out of bounds (unlikely with 3 waits for 4 attempts)
-              local wait_time=${wait_times[$wait_index]:-${wait_times[-1]}}
+              local wait_time
+              if [ $wait_index -lt ${#wait_times[@]} ]; then
+                wait_time=${wait_times[$wait_index]}
+              else
+                wait_time=${wait_times[-1]}
+              fi
 
               echo "   ⚠️ Command failed with code $exit_code. Waiting ${wait_time}s before next attempt..."
               sleep "$wait_time"
