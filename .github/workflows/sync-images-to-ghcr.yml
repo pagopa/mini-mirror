@@ -49,7 +49,7 @@ jobs:
         run: |
           echo "ℹ️ Finding YAML files in docker-image-sync-definitions/ ..."
           # Step 4a: Generate the flat JSON array of image objects
-          FLAT_JSON_ARRAY=$(find docker-image-sync-definitions -name '*.yml' -type f -exec yq -o=json --indent 0 '.' {} + | jq -s 'flatten')
+          FLAT_JSON_ARRAY=$(find docker-image-sync-definitions -name '*.yml' -type f -exec yq -o=json --indent 0 '.' {} + | jq -s 'flatten' | yq --indent 0)
 
           # --- Debug Start: Print Flat Array ---
           echo "--------------------------------------------------"
