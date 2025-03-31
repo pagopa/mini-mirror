@@ -29,13 +29,13 @@ jobs:
       - name: Setup yq
         uses: mikefarah/yq@v4.45.1 # Action to install yq (YAML processor utility)
         with:
-          cmd: yq -o=json '.images' docker-images-sync.yml
+          cmd: yq -o=json --indent 0 '.images' docker-images-sync.yml
 
       # Note: This step also executes yq via 'run'. This might be redundant.
       - name: Generate matrix from YAML
         id: set_matrix
         # Reads the 'images' array from the YAML file (docker-images-sync.yml in the root) and converts it to compact JSON
-        run: echo "matrix=$(yq -o=json '.images' docker-images-sync.yml)" >> $GITHUB_OUTPUT
+        run: echo "matrix=$(yq -o=json --indent 0 '.images' docker-images-sync.yml)" >> $GITHUB_OUTPUT
 
       # New step to display the generated matrix JSON
       - name: Display Generated Matrix JSON
