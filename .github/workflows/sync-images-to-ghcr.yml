@@ -1,5 +1,5 @@
 # .github/workflows/sync-images-to-ghcr.yaml
-name: Sync Images to GHCR
+name: 🎫 Sync Images to GHCR
 
 # Triggers: Run manually or on push/merge to the main branch
 on:
@@ -27,22 +27,22 @@ jobs:
 
       # Note: This step executes yq via the action's 'cmd' input
       - name: Setup yq
-        uses: mikefarah/yq@v4.45.1 # Action to install yq (YAML processor utility)
+        uses: mikefarah/yq@v4.45.1
         with:
-          cmd: yq -o=json --indent 0 '.images' docker-images-sync.yml
+          cmd: yq -o=json --indent=0 '.images' docker-images-sync.yml
 
-      # Note: This step also executes yq via 'run'. This might be redundant.
       - name: Generate matrix from YAML
         id: set_matrix
-        # Reads the 'images' array from the YAML file (docker-images-sync.yml in the root) and converts it to compact JSON
-        run: echo "matrix=$(yq -o=json --indent 0 '.images' docker-images-sync.yml)" >> $GITHUB_OUTPUT
+        run: |
+          # Format the matrix with proper include structure and ensure proper JSON format
+          echo "matrix={\"include\":$(yq -o=json --indent=0 '.images' docker-images-sync.yml)}" >> $GITHUB_OUTPUT
 
-      # New step to display the generated matrix JSON
+      # Debug step to verify the matrix format
       - name: Display Generated Matrix JSON
         run: |
           echo "--------------------------------------------------"
           echo "Generated Matrix JSON Output:"
-          echo "${{ steps.set_matrix.outputs.matrix }}"
+          echo '${{ steps.set_matrix.outputs.matrix }}' | jq '.'
           echo "--------------------------------------------------"
 
   # --- Job 2: Synchronize images in parallel with retry logic (using Bash) ---
