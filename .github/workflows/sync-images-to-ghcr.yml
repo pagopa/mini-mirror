@@ -1,5 +1,5 @@
 # .github/workflows/sync-images-to-ghcr.yaml
-name: Sync Images to GHCR
+name: 🎫 Sync Images to GHCR
 
 # Triggers: Run manually or on push/merge to the main branch
 on:
@@ -25,13 +25,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Note: This step executes yq via the action's 'cmd' input
       - name: Setup yq
-        uses: mikefarah/yq@v4.44.2 # Action to install yq (YAML processor utility)
+        uses: mikefarah/yq@v4.45.1
+        with:
+          cmd: yq -o=json --indent=0 '.images' docker-images-sync.yml
 
       - name: Generate matrix from YAML
         id: set_matrix
-        # Reads the 'images' array from the YAML file (docker-images-sync.yml in the root) and converts it to compact JSON
-        run: echo "matrix=$(yq -o=json -c '.images' docker-images-sync.yml)" >> $GITHUB_OUTPUT
+        run: |
+          # Format the matrix with proper include structure and ensure proper JSON format
+          echo "matrix={\"include\":$(yq -o=json --indent=0 '.images' docker-images-sync.yml)}" >> $GITHUB_OUTPUT
+
+      # Debug step to verify the matrix format
+      - name: Display Generated Matrix JSON
+        run: |
+          echo "--------------------------------------------------"
+          echo "Generated Matrix JSON Output:"
+          echo '${{ steps.set_matrix.outputs.matrix }}' | jq '.'
+          echo "--------------------------------------------------"
 
   # --- Job 2: Synchronize images in parallel with retry logic (using Bash) ---
   sync_image:
@@ -68,7 +80,7 @@ jobs:
           GHCR_PKG: ${{ matrix.ghcr_package_name }}
           GHCR_TAG: ${{ matrix.ghcr_tag }}
           # Build the full image name on GHCR
-          # Note: github.repository_owner is converted to lowercase as required by GHCR
+          # Note: github.repository_owner is NOT converted to lowercase here. This might cause issues with GHCR.
           GHCR_IMAGE_FULL_NAME: ghcr.io/${{ github.repository_owner }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
           DH_IMAGE_FULL_NAME_DIGEST: ${{ matrix.dockerhub_repository }}@${{ matrix.dockerhub_digest }}
         run: |
@@ -105,13 +117,15 @@ jobs:
 
               # Calculate the index for the wait time (0-based)
               local wait_index=$((attempt - 1))
-              # Make sure to use the last wait time if the index is out of bounds (unlikely with 3 waits for 4 attempts)
+              # Make sure to use the last wait time if the index is out of bounds
               local wait_time
               if [ $wait_index -lt ${#wait_times[@]} ]; then
                 wait_time=${wait_times[$wait_index]}
               else
+                # Use the last element if index is out of bounds
                 wait_time=${wait_times[-1]}
               fi
+
 
               echo "   ⚠️ Command failed with code $exit_code. Waiting ${wait_time}s before next attempt..."
               sleep "$wait_time"
@@ -126,7 +140,7 @@ jobs:
           # Redirect stdout and stderr to /dev/null to avoid cluttering the log on success
           if ! docker manifest inspect "$GHCR_IMAGE_FULL_NAME" > /dev/null 2>&1; then
             # --- Image NOT found in GHCR ---
-            echo "ℹ️ Not Found! Image is missing from GHCR. Proceeding with pull and push."
+            echo "ℹ️ Not Found! Image is missing from GHCR. Proceeding with pull and push." # User's emoji choice
 
             # --- PULL with Retry ---
             echo " PULL: Attempting to download image from Docker Hub: $DH_IMAGE_FULL_NAME_DIGEST"
