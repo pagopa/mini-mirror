@@ -58,6 +58,7 @@ jobs:
           if [ -z "$FLAT_JSON_ARRAY" ] || [ "$FLAT_JSON_ARRAY" = "null" ] || [ "$FLAT_JSON_ARRAY" = "[]" ]; then
             echo "⚠️ WARNING: No valid image definitions found or failed to generate JSON array."
             echo "Setting matrix to empty include."
+            # Output the empty structure so the 'if' condition in the next job works reliably
             echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
           else
             echo "✅ Raw Matrix JSON generated."
@@ -77,7 +78,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: prepare_matrix # Depends on the job that prepares the raw matrix
     outputs:
-      filtered_matrix: ${{ steps.filter_step.outputs.filtered_matrix }} # Export the filtered matrix
+      # Default filtered_matrix to empty string if not set by script
+      filtered_matrix: ${{ steps.filter_step.outputs.filtered_matrix || '' }}
     # Only run if the raw matrix is not empty
     if: needs.prepare_matrix.outputs.matrix != '{"include":[]}'
     steps:
@@ -188,8 +190,8 @@ jobs:
               print(f"Error: Failed to parse RAW_MATRIX_JSON.", file=sys.stderr)
               sys.exit(1)
           except Exception as e:
-              print(f"An unexpected error occurred: {e}", file=sys.stderr)
-              sys.exit(1)
+              print(f"An unexpected error occurred during processing: {e}", file=sys.stderr)
+              sys.exit(1) # Exit if errors occurred during filtering
 
 
           print("--------------------------------------------------")
@@ -200,40 +202,48 @@ jobs:
               print("✅ No images were skipped (none found in GHCR).")
           print("--------------------------------------------------")
 
-          # Construct the final filtered matrix object
-          filtered_matrix_obj = {"include": images_to_keep}
 
-          if not images_to_keep:
-             print("⚠️ All images already exist in GHCR or no valid images found. Filtered matrix is empty.")
+          # --- MODIFIED SECTION START ---
+          # Only proceed to set output if there are images to keep
+          if images_to_keep:
+              # Construct the final filtered matrix object
+              filtered_matrix_obj = {"include": images_to_keep}
+
+              # Print the raw list of images to keep, formatted as JSON for better readability in logs
+              print("📋 Images to be Synchronized (raw list):")
+              print(json.dumps(images_to_keep, indent=2))
+              print("--------------------------------------------------")
+
+              # Convert the filtered matrix object to a JSON string
+              filtered_matrix_json_output = json.dumps(filtered_matrix_obj)
+
+              # Set the output for the next job using environment file redirection
+              try:
+                  with open(github_output_env, 'a') as f:
+                      # Ensure the JSON string is properly escaped for multiline output if needed
+                      escaped_json = filtered_matrix_json_output.replace('%', '%25').replace('\n', '%0A').replace('\r', '%0D')
+                      f.write(f"filtered_matrix={escaped_json}\n")
+                  print("✅ Filtered matrix generated and saved to output using Python file I/O.")
+
+              except Exception as e:
+                  print(f"An unexpected error occurred during output writing: {e}", file=sys.stderr)
+                  sys.exit(1) # Exit if output writing fails
           else:
-             # Print the raw list of images to keep, formatted as JSON for better readability in logs
-             print("📋 Images to be Synchronized (raw list):")
-             print(json.dumps(images_to_keep, indent=2))
-          print("--------------------------------------------------")
+             # If images_to_keep is empty, print message and do NOT set the output
+             print("⚠️ No images to synchronize. Output 'filtered_matrix' will not be set.")
+          # --- MODIFIED SECTION END ---
 
-          # Convert the filtered matrix object to a JSON string
-          filtered_matrix_json_output = json.dumps(filtered_matrix_obj)
-
-          # Set the output for the next job using environment file redirection
-          try:
-              with open(github_output_env, 'a') as f:
-                  # Ensure the JSON string is properly escaped for multiline output if needed
-                  escaped_json = filtered_matrix_json_output.replace('%', '%25').replace('\n', '%0A').replace('\r', '%0D')
-                  f.write(f"filtered_matrix={escaped_json}\n")
-              print("✅ Filtered matrix generated and saved to output using Python file I/O.")
-
-          except Exception as e:
-              print(f"An unexpected error occurred during output writing: {e}", file=sys.stderr)
-              sys.exit(1)
           # The closing delimiter MUST be at the start of the line with no trailing characters
           EOF
 
       # Step 5: Display the filtered matrix JSON (using jq for formatting)
-      - name: Display Filtered Matrix JSON
+      # This step will now only show output if the previous step actually set it
+      - name: Display Filtered Matrix JSON (if set)
+        # Only run if the output was actually set in the previous step
+        if: steps.filter_step.outputs.filtered_matrix
         run: |
           echo "--------------------------------------------------"
           echo "Final Filtered Matrix Output (for sync job):"
-          # Read the output variable back from the environment file if needed, or use the step output context
           echo '${{ steps.filter_step.outputs.filtered_matrix }}' | jq '.'
           echo "--------------------------------------------------"
 
@@ -242,19 +252,18 @@ jobs:
   sync_image:
     # Needs the job that filters the matrix
     needs: filter_existing_images
-    # Only run if the *filtered* matrix has images
-    # Check against the output of the filtering step
-    if: needs.filter_existing_images.outputs.filtered_matrix != '{"include":[]}'
+    # MODIFIED: Only run if the filtered matrix output was set (implicitly checks for non-empty string)
+    if: needs.filter_existing_images.outputs.filtered_matrix
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false # If one image fails, others continue
       # Use fromJson with the *filtered* {"include": [...]} structure from the Python script output
+      # This will only run if the 'if' condition above is true, meaning the output exists and is not empty
       matrix: ${{ fromJson(needs.filter_existing_images.outputs.filtered_matrix) }}
     steps:
       - name: Print Image Details for Sync
         env:
-          # Define lowercase owner here using toLower for use in the echo command
-          GH_OWNER_LOWERCASE: ${{ format('{0}', github.repository_owner) }}
+          GH_OWNER_LOWERCASE: ${{ github.repository_owner }}
         run: |
           echo "--------------------------------------------------"
           echo "Syncing Image:"
@@ -284,7 +293,7 @@ jobs:
           GHCR_PKG: ${{ matrix.ghcr_package_name }}
           GHCR_TAG: ${{ matrix.ghcr_tag }}
           # Use GitHub Actions toLower() function for the owner
-          GH_OWNER_LOWERCASE: ${{ format('{0}', github.repository_owner) }}
+          GH_OWNER_LOWERCASE: ${{ github.repository_owner }}
           # Build the full image names using the lowercase owner variable
           GHCR_IMAGE_FULL_NAME: ghcr.io/${{ env.GH_OWNER_LOWERCASE }}/${{ matrix.ghcr_package_name }}:${{ matrix.ghcr_tag }}
           DH_IMAGE_FULL_NAME_DIGEST: ${{ matrix.dockerhub_repository }}@${{ matrix.dockerhub_digest }}
